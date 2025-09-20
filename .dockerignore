@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database files
+*.db
+*.sqlite3
+
+# Environment files
+.env
+
+# OS/macOS/Windows metadata
+.DS_Store
+Thumbs.db
+
+# Git files and directories
+.git
+.gitignore
+
+# Test and temp files/folders
+tests/
+*.log
+*.bak
+*.swp
+*.tmp
+
+# Node modules (if any)
+node_modules/
