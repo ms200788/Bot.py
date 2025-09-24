@@ -1,768 +1,1308 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Telegram Upload Bot - single-file deployment
-- Fixed: health server binds inside on_startup so Render detects port (no port-scan errors).
-- Fixed: /upload -> /d flow reliably finalizes and saves sessions.
-- Persistent jobstore for APScheduler so auto-delete jobs survive restarts.
-- Vault channel storage for permanent Telegram-native file retention.
-- All outgoing user messages are sent without HTML parsing to avoid CantParseEntities.
-- Requirements and Dockerfile notes at bottom.
-"""
+# bot.py
+# Vault-style Telegram bot implementing upload sessions, deep links, persistent auto-delete jobs,
+# DB backups, admin commands, auto-delete scheduling, and health endpoint for Render/UptimeRobot.
+#
+# Notes:
+# - Designed to run with aiogram 2.25.1 (polling), aiohttp 3.8.6, APScheduler 3.10.4.
+# - Uses SQLite for persistent metadata (DB backups pinned in DB channel).
+# - Deep links are randomized tokens (separate from numeric session id).
+# - Broadcast will remove users who blocked the bot or no longer exist and will notify owner.
+# - Health endpoint exposed on PORT so Render/UptimeRobot can ping it.
+#
+# Keep this file as bot.py and deploy with supporting files (Dockerfile, requirements.txt, render.yaml).
 
-# =============================================================
-# Standard library imports
-# =============================================================
 import os
-import sys
-import time
 import logging
-import sqlite3
 import asyncio
+import json
+import sqlite3
+import tempfile
 import traceback
+import secrets
+import string
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 
-# =============================================================
-# Third-party imports
-# =============================================================
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, BotCommand
+from aiogram.dispatcher.handler import CancelHandler
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.utils.deep_linking import get_start_link, decode_payload
-from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter
+from aiogram.utils.callback_data import CallbackData
+
+# executor for polling
+from aiogram.utils import executor
+
+# exceptions from aiogram (import specific ones to avoid import issues)
+from aiogram.utils.exceptions import (
+    BotBlocked,
+    ChatNotFound,
+    RetryAfter,
+    BadRequest,
+    MessageToDeleteNotFound,
+)
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+import aiohttp
 from aiohttp import web
 
-# =============================================================
-# Configuration (read env)
-# =============================================================
-def required_env(name: str) -> str:
-    val = os.environ.get(name)
-    if not val:
-        print(f"ERROR: {name} environment variable is required", file=sys.stderr)
-        sys.exit(1)
-    return val
-
-BOT_TOKEN = required_env("BOT_TOKEN")
-try:
-    OWNER_ID = int(required_env("OWNER_ID"))
-except ValueError:
-    print("ERROR: OWNER_ID must be integer", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    VAULT_CHANNEL_ID = int(required_env("VAULT_CHANNEL_ID"))
-except ValueError:
-    print("ERROR: VAULT_CHANNEL_ID must be integer", file=sys.stderr)
-    sys.exit(1)
-
+# -------------------------
+# Environment configuration
+# -------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID") or 0)
+UPLOAD_CHANNEL_ID = int(os.environ.get("UPLOAD_CHANNEL_ID") or 0)
+DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID") or 0)
 DB_PATH = os.environ.get("DB_PATH", "/data/database.sqlite3")
 JOB_DB_PATH = os.environ.get("JOB_DB_PATH", "/data/jobs.sqlite")
 PORT = int(os.environ.get("PORT", "10000"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 BROADCAST_CONCURRENCY = int(os.environ.get("BROADCAST_CONCURRENCY", "12"))
+AUTO_BACKUP_HOURS = int(os.environ.get("AUTO_BACKUP_HOURS", "12"))
 
-# =============================================================
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
+if OWNER_ID == 0:
+    raise RuntimeError("OWNER_ID is required")
+if UPLOAD_CHANNEL_ID == 0:
+    raise RuntimeError("UPLOAD_CHANNEL_ID is required")
+if DB_CHANNEL_ID == 0:
+    raise RuntimeError("DB_CHANNEL_ID is required")
+
+# -------------------------
 # Logging
-# =============================================================
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
-)
-logger = logging.getLogger("telegram-upload-bot")
+# -------------------------
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger("vaultbot")
 
-# =============================================================
-# SQLite Database wrapper
-# =============================================================
-class Database:
-    def __init__(self, path: str):
-        self.path = path
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.cur = self.conn.cursor()
-        self._create_tables()
+# -------------------------
+# Bot & Dispatcher
+# -------------------------
+bot = Bot(token=BOT_TOKEN, parse_mode='HTML')
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-    def _create_tables(self):
-        # users
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_active INTEGER
-        );
-        """)
-        # start message
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS start_message (
-            id INTEGER PRIMARY KEY,
-            content TEXT,
-            file_id TEXT
-        );
-        """)
-        # sessions
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER,
-            created_at INTEGER,
-            protect INTEGER,
-            auto_delete INTEGER,
-            header_vault_msg_id INTEGER,
-            link_vault_msg_id INTEGER,
-            revoked INTEGER DEFAULT 0
-        );
-        """)
-        # files
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            vault_msg_id INTEGER,
-            file_id TEXT,
-            file_type TEXT,
-            caption TEXT,
-            position INTEGER
-        );
-        """)
-        # access log
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS access_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            user_id INTEGER,
-            accessed_at INTEGER
-        );
-        """)
-        self.conn.commit()
+# -------------------------
+# Scheduler with persistent jobstore
+# -------------------------
+jobstores = {
+    'default': SQLAlchemyJobStore(url=f"sqlite:///{JOB_DB_PATH}")
+}
+scheduler = AsyncIOScheduler(jobstores=jobstores)
+scheduler.configure(timezone="UTC")
 
-    # --- users ---
-    def add_or_update_user(self, user_id: int, username: Optional[str], first_name: Optional[str]):
-        now = int(time.time())
-        self.cur.execute("""
-        INSERT INTO users (user_id, username, first_name, last_active)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name,
-            last_active=excluded.last_active
-        ;
-        """, (user_id, username or "", first_name or "", now))
-        self.conn.commit()
+# -------------------------
+# Callback data factories
+# -------------------------
+cb_choose_protect = CallbackData("protect", "session", "choice")
+cb_retry = CallbackData("retry", "session")
+cb_help_button = CallbackData("helpbtn", "action")
 
-    def touch_user(self, user_id: int):
-        now = int(time.time())
-        self.cur.execute("UPDATE users SET last_active=? WHERE user_id=?", (now, user_id))
-        self.conn.commit()
+# -------------------------
+# DB schema
+# -------------------------
+SCHEMA = """
+PRAGMA foreign_keys = ON;
 
-    def get_all_user_ids(self) -> List[int]:
-        rows = self.cur.execute("SELECT user_id FROM users").fetchall()
-        return [r["user_id"] for r in rows]
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 
-    def count_users(self) -> int:
-        return self.cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    last_seen TEXT
+);
 
-    def count_active_2days(self) -> int:
-        cutoff = int(time.time()) - 2 * 86400
-        return self.cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (cutoff,)).fetchone()[0]
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id INTEGER,
+    created_at TEXT,
+    protect INTEGER DEFAULT 0,
+    auto_delete_minutes INTEGER DEFAULT 0,
+    title TEXT,
+    revoked INTEGER DEFAULT 0,
+    header_msg_id INTEGER,
+    header_chat_id INTEGER,
+    deep_link TEXT
+);
 
-    # --- start message ---
-    def set_start_message(self, content: str, file_id: Optional[str]):
-        self.cur.execute("DELETE FROM start_message")
-        self.cur.execute("INSERT INTO start_message (id, content, file_id) VALUES (1, ?, ?)", (content, file_id))
-        self.conn.commit()
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
+    file_type TEXT,
+    file_id TEXT,
+    caption TEXT,
+    original_msg_id INTEGER,
+    vault_msg_id INTEGER,
+    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
 
-    def get_start_message(self) -> Tuple[str, Optional[str]]:
-        row = self.cur.execute("SELECT content, file_id FROM start_message WHERE id=1").fetchone()
-        if row:
-            return row["content"], row["file_id"]
-        return "Welcome, {username}!", None
+CREATE TABLE IF NOT EXISTS delete_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
+    target_chat_id INTEGER,
+    message_ids TEXT,
+    run_at TEXT,
+    created_at TEXT,
+    status TEXT DEFAULT 'scheduled'
+);
+"""
 
-    # --- sessions & files ---
-    def create_session(self, owner_id: int, protect: int, auto_delete: int, header_vault_msg_id: int, link_vault_msg_id: int) -> int:
-        now = int(time.time())
-        self.cur.execute("""
-        INSERT INTO sessions (owner_id, created_at, protect, auto_delete, header_vault_msg_id, link_vault_msg_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (owner_id, now, protect, auto_delete, header_vault_msg_id, link_vault_msg_id))
-        sid = self.cur.lastrowid
-        self.conn.commit()
-        return sid
+# -------------------------
+# Database initialization
+# -------------------------
+db: sqlite3.Connection  # global
 
-    def add_file(self, session_id: int, vault_msg_id: int, file_id: str, file_type: str, caption: str, position: int):
-        self.cur.execute("""
-        INSERT INTO files (session_id, vault_msg_id, file_id, file_type, caption, position)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (session_id, vault_msg_id, file_id, file_type, caption, position))
-        self.conn.commit()
+def init_db(path: str = DB_PATH):
+    global db
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    need_init = not os.path.exists(path)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    db = conn
+    if need_init:
+        conn.executescript(SCHEMA)
+        conn.commit()
+    return conn
 
-    def get_session(self, session_id: int) -> Optional[sqlite3.Row]:
-        return self.cur.execute("SELECT * FROM sessions WHERE id=? LIMIT 1", (session_id,)).fetchone()
+db = init_db(DB_PATH)
 
-    def get_files_for_session(self, session_id: int) -> List[sqlite3.Row]:
-        return self.cur.execute("SELECT * FROM files WHERE session_id=? ORDER BY position ASC", (session_id,)).fetchall()
+# -------------------------
+# DB helpers
+# -------------------------
+def db_set(key: str, value: str):
+    cur = db.cursor()
+    cur.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
+    db.commit()
 
-    def log_access(self, session_id: int, user_id: int):
-        now = int(time.time())
-        self.cur.execute("INSERT INTO access_log (session_id, user_id, accessed_at) VALUES (?, ?, ?)", (session_id, user_id, now))
-        self.conn.commit()
+def db_get(key: str, default=None):
+    cur = db.cursor()
+    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+    r = cur.fetchone()
+    return r["value"] if r else default
 
-    def revoke_session(self, session_id: int):
-        self.cur.execute("UPDATE sessions SET revoked=1 WHERE id=?", (session_id,))
-        self.conn.commit()
+def sql_insert_session(owner_id:int, protect:int, auto_delete_minutes:int, title:str, header_chat_id:int, header_msg_id:int, deep_link_token:str)->int:
+    cur = db.cursor()
+    cur.execute(
+        "INSERT INTO sessions (owner_id,created_at,protect,auto_delete_minutes,title,header_chat_id,header_msg_id,deep_link) VALUES (?,?,?,?,?,?,?,?)",
+        (owner_id, datetime.utcnow().isoformat(), protect, auto_delete_minutes, title, header_chat_id, header_msg_id, deep_link_token)
+    )
+    db.commit()
+    return cur.lastrowid
 
-    def is_revoked(self, session_id: int) -> bool:
-        row = self.cur.execute("SELECT revoked FROM sessions WHERE id=?", (session_id,)).fetchone()
-        return bool(row["revoked"]) if row else True
+def sql_add_file(session_id:int, file_type:str, file_id:str, caption:str, original_msg_id:int, vault_msg_id:int):
+    cur = db.cursor()
+    cur.execute(
+        "INSERT INTO files (session_id,file_type,file_id,caption,original_msg_id,vault_msg_id) VALUES (?,?,?,?,?,?)",
+        (session_id, file_type, file_id, caption, original_msg_id, vault_msg_id)
+    )
+    db.commit()
+    return cur.lastrowid
 
-    def count_files(self) -> int:
-        return self.cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+def sql_list_sessions(limit=50):
+    cur = db.cursor()
+    cur.execute("SELECT * FROM sessions ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    return [dict(r) for r in rows]
 
-    def count_sessions(self) -> int:
-        return self.cur.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+def sql_get_session_by_id(session_id:int):
+    cur = db.cursor()
+    cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,))
+    r = cur.fetchone()
+    return dict(r) if r else None
 
-    def list_sessions(self) -> List[sqlite3.Row]:
-        return self.cur.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
+def sql_get_session_by_token(token: str):
+    cur = db.cursor()
+    cur.execute("SELECT * FROM sessions WHERE deep_link=?", (token,))
+    r = cur.fetchone()
+    return dict(r) if r else None
 
-    def close(self):
+def sql_get_session_files(session_id:int):
+    cur = db.cursor()
+    cur.execute("SELECT * FROM files WHERE session_id=? ORDER BY id", (session_id,))
+    rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+def sql_set_session_revoked(session_id:int, revoked:int=1):
+    cur = db.cursor()
+    cur.execute("UPDATE sessions SET revoked=? WHERE id=?", (revoked, session_id))
+    db.commit()
+
+def sql_add_user(user: types.User):
+    cur = db.cursor()
+    cur.execute("INSERT OR REPLACE INTO users (id,username,first_name,last_name,last_seen) VALUES (?,?,?,?,?)",
+                (user.id, user.username or "", user.first_name or "", user.last_name or "", datetime.utcnow().isoformat()))
+    db.commit()
+
+def sql_update_user_lastseen(user_id:int, username:str="", first_name:str="", last_name:str=""):
+    cur = db.cursor()
+    cur.execute("INSERT OR REPLACE INTO users (id,username,first_name,last_name,last_seen) VALUES (?,?,?,?,?)",
+                (user_id, username or "", first_name or "", last_name or "", datetime.utcnow().isoformat()))
+    db.commit()
+
+def sql_remove_user(user_id:int):
+    cur = db.cursor()
+    cur.execute("DELETE FROM users WHERE id=?", (user_id,))
+    db.commit()
+
+def sql_stats():
+    cur = db.cursor()
+    cur.execute("SELECT COUNT(*) as cnt FROM users")
+    total_users = cur.fetchone()["cnt"]
+    cur.execute("SELECT COUNT(*) as active FROM users WHERE last_seen >= ?", ((datetime.utcnow()-timedelta(days=2)).isoformat(),))
+    row = cur.fetchone()
+    active = row["active"] if row else 0
+    cur.execute("SELECT COUNT(*) as files FROM files")
+    files = cur.fetchone()["files"]
+    cur.execute("SELECT COUNT(*) as sessions FROM sessions")
+    sessions = cur.fetchone()["sessions"]
+    return {"total_users": total_users, "active_2d": active, "files": files, "sessions": sessions}
+
+def sql_add_delete_job(session_id:int, target_chat_id:int, message_ids:List[int], run_at:datetime):
+    cur = db.cursor()
+    cur.execute("INSERT INTO delete_jobs (session_id,target_chat_id,message_ids,run_at,created_at) VALUES (?,?,?,?,?)",
+                (session_id, target_chat_id, json.dumps(message_ids), run_at.isoformat(), datetime.utcnow().isoformat()))
+    db.commit()
+    return cur.lastrowid
+
+def sql_list_pending_jobs():
+    cur = db.cursor()
+    cur.execute("SELECT * FROM delete_jobs WHERE status='scheduled'")
+    return [dict(r) for r in cur.fetchall()]
+
+def sql_mark_job_done(job_id:int):
+    cur = db.cursor()
+    cur.execute("UPDATE delete_jobs SET status='done' WHERE id=?", (job_id,))
+    db.commit()
+
+# -------------------------
+# In-memory upload sessions
+# -------------------------
+active_uploads: Dict[int, Dict[str, Any]] = {}
+
+def start_upload_session(owner_id:int, exclude_text:bool):
+    active_uploads[owner_id] = {
+        "messages": [], "exclude_text": exclude_text, "started_at": datetime.utcnow()
+    }
+
+def cancel_upload_session(owner_id:int):
+    active_uploads.pop(owner_id, None)
+
+def append_upload_message(owner_id:int, msg: types.Message):
+    if owner_id not in active_uploads:
+        return
+    active_uploads[owner_id]["messages"].append(msg)
+
+def get_upload_messages(owner_id:int) -> List[types.Message]:
+    return active_uploads.get(owner_id, {}).get("messages", [])
+
+# -------------------------
+# Utilities
+# -------------------------
+async def safe_send(chat_id, text=None, **kwargs):
+    try:
+        if text is None:
+            return None
+        return await bot.send_message(chat_id, text, **kwargs)
+    except BotBlocked:
+        logger.warning("Bot blocked by %s", chat_id)
+    except ChatNotFound:
+        logger.warning("Chat not found: %s", chat_id)
+    except RetryAfter as e:
+        logger.warning("Flood wait %s", e.timeout)
+        await asyncio.sleep(e.timeout + 1)
+        return await safe_send(chat_id, text, **kwargs)
+    except Exception:
+        logger.exception("Failed to send message")
+    return None
+
+async def safe_copy(to_chat_id:int, from_chat_id:int, message_id:int, **kwargs):
+    try:
+        return await bot.copy_message(to_chat_id, from_chat_id, message_id, **kwargs)
+    except RetryAfter as e:
+        logger.warning("RetryAfter copying: %s", e.timeout)
+        await asyncio.sleep(e.timeout + 1)
+        return await safe_copy(to_chat_id, from_chat_id, message_id, **kwargs)
+    except Exception:
+        logger.exception("safe_copy failed")
+        return None
+
+async def resolve_channel_link(link: str) -> Optional[int]:
+    link = (link or "").strip()
+    if not link:
+        return None
+    try:
+        # direct ID provided
+        if link.startswith("-100") or link.startswith("-"):
+            return int(link)
+        # t.me link
+        if link.startswith("https://t.me/") or link.startswith("http://t.me/"):
+            name = link.split("/")[-1]
+            if name:
+                ch = await bot.get_chat(name)
+                return ch.id
+        # @username
+        if link.startswith("@"):
+            ch = await bot.get_chat(link)
+            return ch.id
+        # fallback: pass link to get_chat (handles usernames)
+        ch = await bot.get_chat(link)
+        return ch.id
+    except ChatNotFound:
+        logger.warning("resolve_channel_link: chat not found %s", link)
+        return None
+    except Exception as e:
+        logger.warning("resolve_channel_link error %s : %s", link, e)
+        return None
+
+# -------------------------
+# DB backup & restore
+# -------------------------
+async def backup_db_to_channel():
+    try:
+        if DB_CHANNEL_ID == 0:
+            logger.error("DB_CHANNEL_ID not set")
+            return None
+        if not os.path.exists(DB_PATH):
+            logger.error("Local DB missing for backup")
+            return None
+        with open(DB_PATH, "rb") as f:
+            sent = await bot.send_document(DB_CHANNEL_ID, InputFile(f, filename=os.path.basename(DB_PATH)),
+                                           caption=f"DB backup {datetime.utcnow().isoformat()}",
+                                           disable_notification=True)
         try:
-            self.conn.commit()
-            self.conn.close()
+            # try to pin the backup
+            await bot.pin_chat_message(DB_CHANNEL_ID, sent.message_id, disable_notification=True)
+        except ChatNotFound:
+            logger.error("ChatNotFound while pinning DB. Bot might not be in the DB channel.")
+        except Exception:
+            logger.exception("Failed to pin DB backup")
+        return sent
+    except Exception:
+        logger.exception("backup_db_to_channel failed")
+        return None
+
+async def restore_db_from_pinned():
+    global db
+    try:
+        # if local DB exists, skip restore
+        if os.path.exists(DB_PATH):
+            logger.info("Local DB present; skipping restore.")
+            return True
+        logger.info("Attempting DB restore from pinned in DB channel")
+        try:
+            chat = await bot.get_chat(DB_CHANNEL_ID)
+        except ChatNotFound:
+            logger.error("DB channel not found during restore")
+            return False
+        pinned = getattr(chat, "pinned_message", None)
+        if pinned and pinned.document:
+            file_id = pinned.document.file_id
+            file = await bot.get_file(file_id)
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            # download_file uses file.file_path
+            await bot.download_file(file.file_path, tmp.name)
+            tmp.close()
+            os.replace(tmp.name, DB_PATH)
+            logger.info("DB restored from pinned")
+            try:
+                db.close()
+            except Exception:
+                pass
+            db = init_db(DB_PATH)
+            return True
+        logger.error("No pinned DB document found; aborting restore.")
+        return False
+    except Exception:
+        logger.exception("restore_db_from_pinned failed")
+        return False
+
+# -------------------------
+# Delete job executor
+# -------------------------
+async def execute_delete_job(job_id:int, job_row:Dict[str,Any]):
+    try:
+        msg_ids = json.loads(job_row["message_ids"])
+        target_chat = int(job_row["target_chat_id"])
+        for mid in msg_ids:
+            try:
+                await bot.delete_message(target_chat, int(mid))
+            except MessageToDeleteNotFound:
+                pass
+            except ChatNotFound:
+                logger.warning("Chat not found when deleting messages for job %s", job_id)
+            except BotBlocked:
+                logger.warning("Bot blocked when deleting messages for job %s", job_id)
+            except Exception:
+                logger.exception("Error deleting message %s in %s", mid, target_chat)
+        sql_mark_job_done(job_id)
+        try:
+            scheduler.remove_job(f"deljob_{job_id}")
         except Exception:
             pass
+        logger.info("Executed delete job %s", job_id)
+    except Exception:
+        logger.exception("Failed delete job %s", job_id)
 
-# instantiate DB
-db = Database(DB_PATH)
+async def restore_pending_jobs_and_schedule():
+    logger.info("Restoring pending delete jobs")
+    pending = sql_list_pending_jobs()
+    for job in pending:
+        try:
+            run_at = datetime.fromisoformat(job["run_at"])
+            now = datetime.utcnow()
+            job_id = job["id"]
+            if run_at <= now:
+                asyncio.create_task(execute_delete_job(job_id, job))
+            else:
+                scheduler.add_job(execute_delete_job, 'date', run_date=run_at, args=(job_id, job), id=f"deljob_{job_id}")
+                logger.info("Scheduled delete job %s at %s", job_id, run_at.isoformat())
+        except Exception:
+            logger.exception("Failed to restore job %s", job.get("id"))
 
-# =============================================================
-# APScheduler with persistent jobstore (SQLAlchemy)
-# =============================================================
-os.makedirs(os.path.dirname(JOB_DB_PATH) or ".", exist_ok=True)
-jobstore_url = f"sqlite:///{os.path.abspath(JOB_DB_PATH)}"
-jobstores = {'default': SQLAlchemyJobStore(url=jobstore_url)}
-scheduler = AsyncIOScheduler(jobstores=jobstores)
-scheduler.start()
-
-# =============================================================
-# Bot setup
-# - Use parse_mode=None by default when sending messages to users to avoid CantParseEntities.
-# =============================================================
-bot = Bot(token=BOT_TOKEN, parse_mode=None)
-dp = Dispatcher(bot, storage=MemoryStorage())
-broadcast_semaphore = asyncio.Semaphore(BROADCAST_CONCURRENCY)
-
-# =============================================================
-# aiohttp health app (we will start it in on_startup)
-# =============================================================
-async def health_handler(request):
+# -------------------------
+# Health endpoint (aiohttp)
+# -------------------------
+async def handle_health(request):
     return web.Response(text="ok")
 
-health_app = web.Application()
-health_app.router.add_get("/health", health_handler)
-
-# =============================================================
-# FSM states
-# =============================================================
-class UploadStates(StatesGroup):
-    waiting_files = State()
-    choosing_protect = State()
-    choosing_timer = State()
-
-# =============================================================
-# In-memory staging for uploads (owner only)
-# =============================================================
-# Structure: { owner_id: {"items":[{"from_chat_id":..., "message_id":...}, ...], "protect": None, "auto_delete": None } }
-upload_sessions: Dict[int, Dict[str, Any]] = {}
-
-# =============================================================
-# Helpers
-# =============================================================
-def is_owner(uid: int) -> bool:
-    return int(uid) == int(OWNER_ID)
-
-def extract_media_info_from_message(msg: types.Message) -> Tuple[str, Optional[str], Optional[str]]:
-    if msg.photo:
-        return "photo", msg.photo[-1].file_id, msg.caption or ""
-    if msg.video:
-        return "video", msg.video.file_id, msg.caption or ""
-    if msg.document:
-        return "document", msg.document.file_id, msg.caption or ""
-    if msg.audio:
-        return "audio", msg.audio.file_id, msg.caption or ""
-    if msg.voice:
-        return "voice", msg.voice.file_id, msg.caption or ""
-    if msg.sticker:
-        return "sticker", msg.sticker.file_id, ""
-    # fallback to text
-    return "text", msg.text or msg.caption or "", msg.text or msg.caption or ""
-
-async def send_welcome(user: types.User, chat_id: int):
-    content, file_id = db.get_start_message()
-    username = user.username or user.first_name or "there"
-    rendered = content.replace("{username}", username)
+async def run_health_app():
     try:
-        if file_id:
-            await bot.send_photo(chat_id, file_id, caption=rendered)
-        else:
-            await bot.send_message(chat_id, rendered)
+        app = web.Application()
+        app.add_routes([web.get('/', handle_health), web.get('/health', handle_health)])
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        logger.info("Health endpoint running on 0.0.0.0:%s/health", PORT)
     except Exception:
+        logger.exception("Failed to start health server")
+
+# -------------------------
+# Utilities for buttons and owner check
+# -------------------------
+def is_owner(user_id:int)->bool:
+    return user_id == OWNER_ID
+
+def build_channel_buttons(optional_list:List[Dict[str,str]], forced_list:List[Dict[str,str]]):
+    kb = InlineKeyboardMarkup()
+    # optional channels first as buttons
+    for ch in optional_list[:4]:
+        kb.add(InlineKeyboardButton(ch.get("name","Channel"), url=ch.get("link")))
+    # forced channels - label Join
+    for ch in forced_list[:3]:
+        kb.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
+    # help button
+    kb.add(InlineKeyboardButton("Help", callback_data=cb_help_button.new(action="open")))
+    return kb
+
+# -------------------------
+# Deep-link token generator
+# -------------------------
+def generate_token(length: int = 8) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+# -------------------------
+# Command handlers
+# -------------------------
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    """
+    Handles /start and deep link resolution.
+    Accepts either numeric session id or randomized token as payload.
+    Delivers only the original captions and copies of the stored vault messages.
+    Applies auto-delete scheduling according to session setting.
+    """
+    try:
+        # record user
+        sql_add_user(message.from_user)
+        args = message.get_args().strip()
+        payload = args if args else None
+
+        # prepare start text and channel buttons
+        start_text = db_get("start_text", "Welcome, {first_name}!")
+        start_text = start_text.replace("{username}", message.from_user.username or "").replace("{first_name}", message.from_user.first_name or "")
+        optional_json = db_get("optional_channels", "[]")
+        forced_json = db_get("force_channels", "[]")
         try:
-            await bot.send_message(chat_id, rendered)
+            optional = json.loads(optional_json)
+        except Exception:
+            optional = []
+        try:
+            forced = json.loads(forced_json)
+        except Exception:
+            forced = []
+        kb = build_channel_buttons(optional, forced)
+
+        if not payload:
+            await message.answer(start_text, reply_markup=kb)
+            return
+
+        # payload may be numeric id or token
+        s = None
+        try:
+            sid = int(payload)
+            s = sql_get_session_by_id(sid)
+        except Exception:
+            # treat payload as token
+            s = sql_get_session_by_token(payload)
+
+        if not s or s.get("revoked"):
+            await message.answer("This session link is invalid or revoked.")
+            return
+
+        # verify forced channels: ensure user is not blocked from them and has joined
+        blocked = False
+        unresolved = []
+        for ch in forced[:3]:
+            link = ch.get("link")
+            resolved = await resolve_channel_link(link)
+            if resolved:
+                try:
+                    member = await bot.get_chat_member(resolved, message.from_user.id)
+                    # treat left/kicked as not joined
+                    if getattr(member, "status", None) in ("left", "kicked"):
+                        blocked = True
+                        break
+                except BadRequest:
+                    blocked = True
+                    break
+                except ChatNotFound:
+                    unresolved.append(link)
+                except Exception:
+                    unresolved.append(link)
+            else:
+                unresolved.append(link)
+
+        if blocked:
+            kb2 = InlineKeyboardMarkup()
+            for ch in forced[:3]:
+                kb2.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
+            kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=s["id"])))
+            await message.answer("You must join the required channels first.", reply_markup=kb2)
+            return
+
+        if unresolved:
+            kb2 = InlineKeyboardMarkup()
+            for ch in forced[:3]:
+                kb2.add(InlineKeyboardButton(ch.get("name","Join"), url=ch.get("link")))
+            kb2.add(InlineKeyboardButton("Retry", callback_data=cb_retry.new(session=s["id"])))
+            await message.answer("Some channels could not be automatically verified. Please join them and press Retry.", reply_markup=kb2)
+            return
+
+        # deliver files
+        files = sql_get_session_files(s["id"])
+        delivered_msg_ids = []
+        owner_is_requester = (message.from_user.id == s.get("owner_id"))
+        protect_flag = s.get("protect", 0)
+        for f in files:
+            try:
+                if f["file_type"] == "text":
+                    m = await bot.send_message(message.chat.id, f.get("caption") or "")
+                    delivered_msg_ids.append(m.message_id)
+                else:
+                    try:
+                        # copy from upload channel to user chat; owner bypasses protect
+                        m = await bot.copy_message(message.chat.id, UPLOAD_CHANNEL_ID, f["vault_msg_id"],
+                                                   caption=f.get("caption") or "",
+                                                   protect_content=bool(protect_flag) and not owner_is_requester)
+                        delivered_msg_ids.append(m.message_id)
+                    except Exception:
+                        # fallback: send by file_id type
+                        if f["file_type"] == "photo":
+                            sent = await bot.send_photo(message.chat.id, f["file_id"], caption=f.get("caption") or "")
+                            delivered_msg_ids.append(sent.message_id)
+                        elif f["file_type"] == "video":
+                            sent = await bot.send_video(message.chat.id, f["file_id"], caption=f.get("caption") or "")
+                            delivered_msg_ids.append(sent.message_id)
+                        elif f["file_type"] == "document":
+                            sent = await bot.send_document(message.chat.id, f["file_id"], caption=f.get("caption") or "")
+                            delivered_msg_ids.append(sent.message_id)
+                        elif f["file_type"] == "sticker":
+                            try:
+                                sent = await bot.send_sticker(message.chat.id, f["file_id"])
+                                delivered_msg_ids.append(sent.message_id)
+                            except Exception:
+                                pass
+                        else:
+                            sent = await bot.send_message(message.chat.id, f.get("caption") or "")
+                            delivered_msg_ids.append(sent.message_id)
+            except Exception:
+                logger.exception("Error delivering file in session %s", s["id"])
+
+        # schedule auto-delete if set
+        minutes = int(s.get("auto_delete_minutes", 0) or 0)
+        if minutes and delivered_msg_ids:
+            run_at = datetime.utcnow() + timedelta(minutes=minutes)
+            job_db_id = sql_add_delete_job(s["id"], message.chat.id, delivered_msg_ids, run_at)
+            scheduler.add_job(execute_delete_job, 'date', run_date=run_at,
+                              args=(job_db_id, {"id": job_db_id, "message_ids": json.dumps(delivered_msg_ids),
+                                                "target_chat_id": message.chat.id, "run_at": run_at.isoformat()}),
+                              id=f"deljob_{job_db_id}")
+            await message.answer(f"Messages will be auto-deleted in {minutes} minutes.")
+
+        await message.answer("Delivery complete.")
+    except Exception:
+        logger.exception("Error in /start handler")
+        await message.reply("An error occurred while processing your request.")
+
+# -------------------------
+# Upload commands (owner only)
+# -------------------------
+@dp.message_handler(commands=["upload"])
+async def cmd_upload(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    args = message.get_args().strip().lower()
+    exclude_text = False
+    if "exclude_text" in args:
+        exclude_text = True
+    start_upload_session(OWNER_ID, exclude_text)
+    await message.reply("Upload session started. Send media/text you want included. Use /d to finalize, /e to cancel.")
+
+@dp.message_handler(commands=["e"])
+async def cmd_cancel_upload(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+    cancel_upload_session(OWNER_ID)
+    await message.reply("Upload canceled.")
+
+@dp.message_handler(commands=["d"])
+async def cmd_finalize_upload(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+    upload = active_uploads.get(OWNER_ID)
+    if not upload:
+        await message.reply("No active upload session.")
+        return
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("Protect ON", callback_data=cb_choose_protect.new(session="pending", choice="1")),
+           InlineKeyboardButton("Protect OFF", callback_data=cb_choose_protect.new(session="pending", choice="0")))
+    await message.reply("Choose Protect setting:", reply_markup=kb)
+    upload["_finalize_requested"] = True
+
+@dp.callback_query_handler(cb_choose_protect.filter())
+async def _on_choose_protect(call: types.CallbackQuery, callback_data: dict):
+    await call.answer()
+    try:
+        choice = int(callback_data.get("choice", "0"))
+        if OWNER_ID not in active_uploads:
+            await call.message.answer("Upload session expired.")
+            return
+        active_uploads[OWNER_ID]["_protect_choice"] = choice
+        await call.message.answer("Enter auto-delete timer in minutes (0-10080). 0 = no auto-delete. Reply with a number (e.g., 60).")
+    except Exception:
+        logger.exception("Error in choose_protect callback")
+
+@dp.message_handler(lambda m: m.from_user.id == OWNER_ID and "_finalize_requested" in active_uploads.get(OWNER_ID, {}), content_types=types.ContentTypes.TEXT)
+async def _receive_minutes(m: types.Message):
+    try:
+        txt = m.text.strip()
+        try:
+            mins = int(float(txt))
+            if mins < 0 or mins > 10080:
+                raise ValueError()
+        except Exception:
+            await m.reply("Please send a valid integer between 0 and 10080.")
+            return
+        if mins > 0 and mins < 1:
+            mins = 1
+        upload = active_uploads.get(OWNER_ID)
+        if not upload:
+            await m.reply("Upload session missing.")
+            return
+        messages: List[types.Message] = upload.get("messages", [])
+        protect = upload.get("_protect_choice", 0)
+
+        # send a header in upload channel and create session with random token
+        try:
+            header = await bot.send_message(UPLOAD_CHANNEL_ID, "Uploading session...")
+        except ChatNotFound:
+            await m.reply("Upload channel not found. Please ensure the bot is in the UPLOAD_CHANNEL.")
+            logger.error("ChatNotFound uploading to UPLOAD_CHANNEL_ID")
+            return
+        header_msg_id = header.message_id
+        header_chat_id = header.chat.id
+
+        # generate random token for deep link
+        token = generate_token(8)
+        # ensure token uniqueness (very unlikely to collide, but check)
+        attempt = 0
+        while sql_get_session_by_token(token) is not None and attempt < 5:
+            token = generate_token(8)
+            attempt += 1
+
+        # insert session
+        session_temp_id = sql_insert_session(OWNER_ID, protect, mins, "Untitled", header_chat_id, header_msg_id, token)
+
+        # build deep link URL
+        me = await bot.get_me()
+        bot_username = me.username or db_get("bot_username") or ""
+        deep_link = f"https://t.me/{bot_username}?start={token}"
+
+        # update header message with link
+        try:
+            await bot.edit_message_text(f"Session {session_temp_id}\n{deep_link}", UPLOAD_CHANNEL_ID, header_msg_id)
         except Exception:
             pass
 
-# =============================================================
-# Persistent deletion worker functions
-# - scheduler will store jobs that call _delete_messages_job_runner
-# - this runner schedules the actual async delete coroutine on the bot's event loop
-# =============================================================
-def _delete_messages_job_runner(chat_id: int, message_ids: List[int]):
-    """
-    Synchronous function called by APScheduler from the jobstore.
-    It schedules the asynchronous deletion on the bot's event loop.
-    Stored in jobstore by function path so it must be top-level in this module.
-    """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    # schedule coroutine thread-safely
-    asyncio.run_coroutine_threadsafe(_delete_messages_async(chat_id, message_ids), loop)
-
-async def _delete_messages_async(chat_id: int, message_ids: List[int]):
-    for mid in message_ids:
-        try:
-            await bot.delete_message(chat_id, mid)
-        except Exception as exc:
-            logger.debug("Failed to delete message %s in chat %s: %s", mid, chat_id, exc)
-
-def schedule_persistent_deletion(chat_id: int, message_ids: List[int], seconds: int):
-    if seconds <= 0 or not message_ids:
-        return
-    run_date = datetime.utcnow() + timedelta(seconds=seconds)
-    # schedule the synchronous runner so jobstore can serialize its path
-    scheduler.add_job(_delete_messages_job_runner, "date", run_date=run_date, args=[chat_id, message_ids])
-    logger.info("Scheduled persistent deletion for chat %s at %s (messages: %s)", chat_id, run_date.isoformat(), message_ids)
-
-# =============================================================
-# Bot handlers
-# =============================================================
-@dp.message_handler(commands=["start"])
-async def handler_start(message: types.Message):
-    db.add_or_update_user(message.from_user.id, message.from_user.username or "", message.from_user.first_name)
-    args = message.get_args()
-    if args:
-        # decode payload (aiogram's get_start_link encodes payload)
-        try:
-            payload = decode_payload(args)
-            session_id = int(payload)
-        except Exception as exc:
-            logger.warning("Invalid deep-link payload from %s: %s", message.from_user.id, exc)
-            await message.reply("Invalid link.", parse_mode=None)
-            return
-
-        session = db.get_session(session_id)
-        if not session:
-            await message.reply("Session not found.", parse_mode=None)
-            return
-
-        if db.is_revoked(session_id):
-            await message.reply("This session has been revoked by the owner.", parse_mode=None)
-            return
-
-        files = db.get_files_for_session(session_id)
-        if not files:
-            await message.reply("No files in this session.", parse_mode=None)
-            return
-
-        # log access & update last active
-        db.log_access(session_id, message.from_user.id)
-        db.touch_user(message.from_user.id)
-
-        protect_flag = bool(session["protect"]) and (not is_owner(message.from_user.id))
-        auto_delete_seconds = int(session["auto_delete"]) if session["auto_delete"] else 0
-
-        delivered_message_ids: List[int] = []
-        for f in files:
-            ftype = f["file_type"]
-            fid = f["file_id"]
-            caption = f["caption"] or ""
+        # copy/upload messages into upload channel (vault)
+        for m0 in messages:
             try:
-                if ftype == "photo":
-                    msg = await bot.send_photo(message.chat.id, fid, caption=caption, protect_content=protect_flag)
-                elif ftype == "video":
-                    msg = await bot.send_video(message.chat.id, fid, caption=caption, protect_content=protect_flag)
-                elif ftype == "document":
-                    msg = await bot.send_document(message.chat.id, fid, caption=caption, protect_content=protect_flag)
-                elif ftype == "audio":
-                    msg = await bot.send_audio(message.chat.id, fid, caption=caption, protect_content=protect_flag)
-                elif ftype == "voice":
-                    msg = await bot.send_voice(message.chat.id, fid, caption=caption, protect_content=protect_flag)
-                elif ftype == "sticker":
-                    msg = await bot.send_sticker(message.chat.id, fid)
-                elif ftype == "text":
-                    msg = await bot.send_message(message.chat.id, caption or fid)
+                # ignore bot commands in session content
+                if m0.text and m0.text.strip().startswith("/"):
+                    continue
+
+                if m0.text and (not upload.get("exclude_text")) and not (m0.photo or m0.video or m0.document or m0.sticker or m0.animation):
+                    sent = await bot.send_message(UPLOAD_CHANNEL_ID, m0.text)
+                    sql_add_file(session_temp_id, "text", "", m0.text or "", m0.message_id, sent.message_id)
+                elif m0.photo:
+                    file_id = m0.photo[-1].file_id
+                    sent = await bot.send_photo(UPLOAD_CHANNEL_ID, file_id, caption=m0.caption or "")
+                    sql_add_file(session_temp_id, "photo", file_id, m0.caption or "", m0.message_id, sent.message_id)
+                elif m0.video:
+                    file_id = m0.video.file_id
+                    sent = await bot.send_video(UPLOAD_CHANNEL_ID, file_id, caption=m0.caption or "")
+                    sql_add_file(session_temp_id, "video", file_id, m0.caption or "", m0.message_id, sent.message_id)
+                elif m0.document:
+                    file_id = m0.document.file_id
+                    sent = await bot.send_document(UPLOAD_CHANNEL_ID, file_id, caption=m0.caption or "")
+                    sql_add_file(session_temp_id, "document", file_id, m0.caption or "", m0.message_id, sent.message_id)
+                elif m0.sticker:
+                    file_id = m0.sticker.file_id
+                    sent = await bot.send_sticker(UPLOAD_CHANNEL_ID, file_id)
+                    sql_add_file(session_temp_id, "sticker", file_id, "", m0.message_id, sent.message_id)
+                elif m0.animation:
+                    file_id = m0.animation.file_id
+                    sent = await bot.send_animation(UPLOAD_CHANNEL_ID, file_id, caption=m0.caption or "")
+                    sql_add_file(session_temp_id, "animation", file_id, m0.caption or "", m0.message_id, sent.message_id)
                 else:
-                    msg = await bot.send_message(message.chat.id, caption or fid)
-                if msg:
-                    delivered_message_ids.append(msg.message_id)
-            except Exception as exc:
-                logger.exception("Error delivering file %s: %s", fid, exc)
-                # continue with next file
+                    try:
+                        sent = await bot.copy_message(UPLOAD_CHANNEL_ID, m0.chat.id, m0.message_id)
+                        caption = getattr(m0, "caption", None) or getattr(m0, "text", "") or ""
+                        sql_add_file(session_temp_id, "other", "", caption or "", m0.message_id, sent.message_id)
+                    except Exception:
+                        logger.exception("Failed copying message during finalize")
+            except Exception:
+                logger.exception("Error copying message during finalize")
 
-        if auto_delete_seconds > 0 and delivered_message_ids:
-            schedule_persistent_deletion(message.chat.id, delivered_message_ids, auto_delete_seconds)
-        return
+        # update session deep_link and header info (already set in insert, but make sure)
+        cur = db.cursor()
+        cur.execute("UPDATE sessions SET deep_link=?, header_msg_id=?, header_chat_id=? WHERE id=?", (token, header_msg_id, header_chat_id, session_temp_id))
+        db.commit()
 
-    # plain start
-    await send_welcome(message.from_user, message.chat.id)
+        # backup DB after upload
+        await backup_db_to_channel()
 
-@dp.message_handler(commands=["help"])
-async def handler_help(message: types.Message):
+        # cancel and clear upload session
+        cancel_upload_session(OWNER_ID)
+        await m.reply(f"Session finalized: {deep_link}")
+        try:
+            active_uploads.pop(OWNER_ID, None)
+        except Exception:
+            pass
+        raise CancelHandler()
+    except CancelHandler:
+        raise
+    except Exception:
+        logger.exception("Error finalizing upload")
+        await m.reply("An error occurred during finalization.")
+
+# -------------------------
+# Settings: setmessage, setimage, setchannel, help
+# -------------------------
+@dp.message_handler(commands=["setmessage"])
+async def cmd_setmessage(message: types.Message):
+    """
+    Owner can set start/help texts.
+    Usage:
+      - Reply to a message with /setmessage start
+      - Or send /setmessage start Your text here
+    """
     if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
         return
-    text = (
-        "Owner Commands:\n"
-        "/setimage - Reply to message (text/photo) to set welcome message (use {username}).\n"
-        "/upload - Start multi-file upload session (owner only).\n"
-        "/d - Finish upload and save session (after sending files).\n"
-        "/e - Cancel current upload session.\n"
-        "/broadcast - Reply to a message to broadcast to all users.\n"
-        "/stats - Show usage stats.\n"
-        "/list_sessions - List saved sessions.\n"
-        "/revoke <id> - Revoke a session.\n"
-        "/help - Show this help.\n\n"
-        "Public:\n"
-        "/start - Show welcome or open a session via deep link."
-    )
-    await message.reply(text, parse_mode=None)
+    args_raw = message.get_args().strip()
+    # if replied and no args, interpret target from command text
+    if message.reply_to_message and (not args_raw):
+        parts = message.text.strip().split()
+        if len(parts) >= 2:
+            target = parts[1].lower()
+        else:
+            await message.reply("Usage: reply to a text with `/setmessage start` or `/setmessage help`, or use `/setmessage start <text>`.")
+            return
+        if message.reply_to_message.text:
+            db_set(f"{target}_text", message.reply_to_message.text)
+            await message.reply(f"{target} message updated.")
+            return
+    parts = args_raw.split(" ", 1)
+    if not parts or not parts[0]:
+        await message.reply("Usage: /setmessage start <text> OR reply to a message with `/setmessage start`.")
+        return
+    target = parts[0].lower()
+    if len(parts) == 1:
+        await message.reply("Provide the message text after the target or reply to a message containing the text.")
+        return
+    txt = parts[1]
+    db_set(f"{target}_text", txt)
+    await message.reply(f"{target} message updated.")
 
 @dp.message_handler(commands=["setimage"])
-async def handler_setimage(message: types.Message):
+async def cmd_setimage(message: types.Message):
+    """
+    Owner can set image for start/help by replying with a photo/document/sticker/animation.
+    Usage:
+      - Reply to the media with /setimage start
+      - Reply to the media with /setimage help
+    """
     if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
         return
     if not message.reply_to_message:
-        await message.reply("Reply to a text or photo to set the welcome message.", parse_mode=None)
+        await message.reply("Reply to a photo/document/sticker/animation with `/setimage start` or `/setimage help`.")
         return
-    reply = message.reply_to_message
-    content = reply.caption or reply.text or ""
+    parts = message.get_args().strip().split()
+    target = parts[0].lower() if parts else "start"
+    rt = message.reply_to_message
     file_id = None
-    if reply.photo:
-        file_id = reply.photo[-1].file_id
-    db.set_start_message(content, file_id)
-    await message.reply("Start message updated.", parse_mode=None)
+    if rt.photo:
+        file_id = rt.photo[-1].file_id
+    elif rt.document:
+        file_id = rt.document.file_id
+    elif rt.sticker:
+        file_id = rt.sticker.file_id
+    elif rt.animation:
+        file_id = rt.animation.file_id
+    else:
+        await message.reply("Reply must contain a photo, image document, sticker, or animation.")
+        return
+    db_set(f"{target}_image", file_id)
+    await message.reply(f"{target} image set.")
 
-# =============================================================
-# Upload flow
-# =============================================================
-@dp.message_handler(commands=["upload"])
-async def handler_upload(message: types.Message):
+@dp.message_handler(commands=["setchannel"])
+async def cmd_setchannel(message: types.Message):
+    """
+    Set forced-join channels (max 3). Usage:
+      /setchannel <name> <channel_link>
+      /setchannel none  -> clears forced channels
+    The bot will require joining these channels to access sessions.
+    """
     if not is_owner(message.from_user.id):
-        return
-    upload_sessions[message.from_user.id] = {"items": [], "protect": None, "auto_delete": None}
-    await UploadStates.waiting_files.set()
-    await message.reply("Upload session started. Send files now (photos, videos, docs, text). When done, send /d to finish or /e to cancel.", parse_mode=None)
-
-@dp.message_handler(commands=["e"], state=UploadStates.waiting_files)
-async def handler_cancel_upload(message: types.Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    upload_sessions.pop(message.from_user.id, None)
-    await state.finish()
-    await message.reply("Upload session canceled.", parse_mode=None)
-
-@dp.message_handler(content_types=types.ContentType.ANY, state=UploadStates.waiting_files)
-async def handler_collect_files(message: types.Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    owner = message.from_user.id
-    sess = upload_sessions.get(owner)
-    if sess is None:
-        return
-    # store original message identifiers
-    sess["items"].append({"from_chat_id": message.chat.id, "message_id": message.message_id})
-    await message.reply("File added to session.", parse_mode=None)
-
-@dp.message_handler(commands=["d"], state=UploadStates.waiting_files)
-async def handler_finish_prompt_protect(message: types.Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    owner = message.from_user.id
-    sess = upload_sessions.get(owner)
-    if not sess or not sess.get("items"):
-        await message.reply("No files uploaded in this session. Use /upload then send files.", parse_mode=None)
-        return
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Protect ON", callback_data="protect_on"))
-    kb.add(InlineKeyboardButton("Protect OFF", callback_data="protect_off"))
-    await message.reply("Protect content? (prevents forwarding/downloading for non-owner). Choose an option.", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("protect_"))
-async def handler_protect_choice(callback: types.CallbackQuery):
-    owner = callback.from_user.id
-    if owner not in upload_sessions:
-        await callback.answer("Session not found.", show_alert=True)
-        return
-    upload_sessions[owner]["protect"] = 1 if callback.data == "protect_on" else 0
-    await UploadStates.choosing_timer.set()
-    await callback.message.edit_text("Enter auto-delete timer in hours (0 for none). Range 0 - 168. Example: 10")
-
-@dp.message_handler(lambda m: m.from_user.id in upload_sessions and upload_sessions[m.from_user.id]["protect"] is not None, state=UploadStates.choosing_timer)
-async def handler_timer_input(message: types.Message, state: FSMContext):
-    owner = message.from_user.id
-    if owner not in upload_sessions:
-        await message.reply("Session not found.", parse_mode=None)
-        await state.finish()
-        return
-    info = upload_sessions[owner]
-    try:
-        hours = float(message.text.strip())
-    except Exception:
-        await message.reply("Invalid hours. Send a number between 0 and 168.", parse_mode=None)
-        return
-    if hours < 0 or hours > 168:
-        await message.reply("Hours out of range (0-168).", parse_mode=None)
-        return
-    auto_delete_seconds = int(hours * 3600)
-    protect_flag = int(info.get("protect", 0))
-    items = info.get("items", [])
-
-    # create header placeholder in vault channel
-    try:
-        header_msg = await bot.send_message(VAULT_CHANNEL_ID, "Preparing session...")
-    except Exception as exc:
-        logger.exception("Failed to send header to vault: %s", exc)
-        await message.reply("Failed to write to vault channel. Check VAULT_CHANNEL_ID and bot admin rights.", parse_mode=None)
-        await state.finish()
-        return
-
-    # create link placeholder
-    try:
-        link_placeholder = await bot.send_message(VAULT_CHANNEL_ID, "Preparing session link...")
-    except Exception as exc:
-        logger.exception("Failed to create link placeholder: %s", exc)
-        await message.reply("Failed to write to vault channel.", parse_mode=None)
-        await state.finish()
-        return
-
-    # copy items into vault preserving original captions
-    copied_info = []
-    pos = 0
-    for it in items:
-        from_chat = it["from_chat_id"]
-        mid = it["message_id"]
-        try:
-            copied = await bot.copy_message(chat_id=VAULT_CHANNEL_ID, from_chat_id=from_chat, message_id=mid)
-            ftype, fid, caption = extract_media_info_from_message(copied)
-            copied_info.append({
-                "vault_msg_id": copied.message_id,
-                "file_id": fid,
-                "file_type": ftype,
-                "caption": caption or "",
-                "position": pos
-            })
-            pos += 1
-            await asyncio.sleep(0.06)
-        except Exception as exc:
-            logger.exception("Failed to copy message %s from %s into vault: %s", mid, from_chat, exc)
-            # continue copying others
-
-    # persist session in DB
-    try:
-        session_id = db.create_session(owner, protect_flag, auto_delete_seconds, header_msg.message_id, link_placeholder.message_id)
-    except Exception as exc:
-        logger.exception("Failed to create session in DB: %s", exc)
-        await message.reply("Failed to create session record.", parse_mode=None)
-        await state.finish()
-        return
-
-    # edit header to include session id
-    try:
-        await bot.edit_message_text(f"📦 Session {session_id}", chat_id=VAULT_CHANNEL_ID, message_id=header_msg.message_id)
-    except Exception as exc:
-        logger.exception("Failed to edit header: %s", exc)
-
-    # save files metadata
-    for ci in copied_info:
-        try:
-            db.add_file(session_id, ci["vault_msg_id"], ci["file_id"], ci["file_type"], ci["caption"], ci["position"])
-        except Exception as exc:
-            logger.exception("Failed to add file metadata for session %s: %s", session_id, exc)
-
-    # build deep link
-    try:
-        start_link = await get_start_link(str(session_id), encode=True)
-    except Exception as exc:
-        logger.exception("Failed to build start link: %s", exc)
-        me = await bot.get_me()
-        start_link = f"https://t.me/{me.username}?start={session_id}"
-
-    # update link placeholder with start link
-    try:
-        await bot.edit_message_text(f"🔗 Files saved in Session {session_id}: {start_link}", chat_id=VAULT_CHANNEL_ID, message_id=link_placeholder.message_id)
-    except Exception as exc:
-        logger.exception("Failed to update link placeholder: %s", exc)
-
-    # notify owner
-    try:
-        await message.reply(f"Upload complete. Session {session_id} link:\n{start_link}", parse_mode=None)
-    except Exception:
-        pass
-
-    # clear in-memory session and finish FSM
-    upload_sessions.pop(owner, None)
-    await state.finish()
-
-# =============================================================
-# Broadcast / stats / list / revoke
-# =============================================================
-@dp.message_handler(commands=["broadcast"])
-async def handler_broadcast(message: types.Message):
-    if not is_owner(message.from_user.id):
-        return
-    if not message.reply_to_message:
-        await message.reply("Reply to a message to broadcast.", parse_mode=None)
-        return
-    users = db.get_all_user_ids()
-    if not users:
-        await message.reply("No users to broadcast to.", parse_mode=None)
-        return
-    await message.reply(f"Starting broadcast to {len(users)} users...", parse_mode=None)
-    sent = 0
-    failed = 0
-    async def send_to(uid:int):
-        nonlocal sent, failed
-        async with broadcast_semaphore:
-            try:
-                await message.reply_to_message.copy_to(uid)
-                sent += 1
-            except (BotBlocked, ChatNotFound):
-                failed += 1
-            except RetryAfter as e:
-                await asyncio.sleep(e.timeout + 1)
-                try:
-                    await message.reply_to_message.copy_to(uid)
-                    sent += 1
-                except Exception:
-                    failed += 1
-            except Exception:
-                failed += 1
-    tasks = [asyncio.create_task(send_to(uid)) for uid in users]
-    await asyncio.gather(*tasks)
-    await message.reply(f"Broadcast finished. Sent: {sent}, Failed: {failed}", parse_mode=None)
-
-@dp.message_handler(commands=["stats"])
-async def handler_stats(message: types.Message):
-    if not is_owner(message.from_user.id):
-        return
-    total_users = db.count_users()
-    active_2d = db.count_active_2days()
-    total_files = db.count_files()
-    total_sessions = db.count_sessions()
-    await message.reply(f"Users active (2d): {active_2d}\nTotal users: {total_users}\nTotal files: {total_files}\nTotal sessions: {total_sessions}", parse_mode=None)
-
-@dp.message_handler(commands=["list_sessions"])
-async def handler_list_sessions(message: types.Message):
-    if not is_owner(message.from_user.id):
-        return
-    rows = db.list_sessions()
-    if not rows:
-        await message.reply("No sessions found.", parse_mode=None)
-        return
-    parts = []
-    for r in rows:
-        created = datetime.utcfromtimestamp(r["created_at"]).isoformat() + "Z"
-        parts.append(f"ID:{r['id']} owner:{r['owner_id']} created:{created} protect:{r['protect']} auto_delete:{r['auto_delete']} revoked:{r['revoked']}")
-    chunk = ""
-    for line in parts:
-        if len(chunk) + len(line) + 1 > 3500:
-            await message.reply(chunk, parse_mode=None)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        await message.reply(chunk, parse_mode=None)
-
-@dp.message_handler(commands=["revoke"])
-async def handler_revoke(message: types.Message):
-    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
         return
     args = message.get_args().strip()
     if not args:
-        await message.reply("Usage: /revoke <session_id>", parse_mode=None)
+        await message.reply("Usage: /setchannel <name> <channel_link> OR /setchannel none")
+        return
+    if args.lower() == "none":
+        db_set("force_channels", json.dumps([]))
+        await message.reply("Forced channels cleared.")
+        return
+    parts = args.split(" ", 1)
+    if len(parts) < 2:
+        await message.reply("Provide name and link.")
+        return
+    name, link = parts[0].strip(), parts[1].strip()
+    try:
+        arr = json.loads(db_get("force_channels", "[]"))
+    except Exception:
+        arr = []
+    updated = False
+    for entry in arr:
+        if entry.get("name") == name or entry.get("link") == link:
+            entry["name"] = name
+            entry["link"] = link
+            updated = True
+            break
+    if not updated:
+        if len(arr) >= 3:
+            await message.reply("Max 3 forced channels allowed.")
+            return
+        arr.append({"name": name, "link": link})
+    db_set("force_channels", json.dumps(arr))
+    await message.reply("Forced channels updated.")
+
+# -------------------------
+# Help handlers
+# -------------------------
+@dp.callback_query_handler(cb_help_button.filter())
+async def cb_help(call: types.CallbackQuery, callback_data: dict):
+    await call.answer()
+    txt = db_get("help_text", "Help is not set.")
+    img = db_get("help_image")
+    try:
+        if img:
+            await bot.send_photo(call.from_user.id, img, caption=txt)
+        else:
+            await bot.send_message(call.from_user.id, txt)
+    except Exception:
+        logger.exception("Failed to send help to user")
+        try:
+            await call.message.answer("Failed to open help.")
+        except Exception:
+            pass
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    txt = db_get("help_text", "Help is not set.")
+    img = db_get("help_image")
+    if img:
+        try:
+            await message.reply_photo(img, caption=txt)
+        except Exception:
+            await message.reply(txt)
+    else:
+        await message.reply(txt)
+
+# -------------------------
+# Admin & utility commands
+# -------------------------
+@dp.message_handler(commands=["adminp"])
+async def cmd_adminp(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    s = sql_stats()
+    txt = (
+        "Owner panel:\n"
+        "/upload - start upload session\n"
+        "/d - finalize upload (choose protect + minutes)\n"
+        "/e - cancel upload\n"
+        "/setmessage - set start/help text\n"
+        "/setimage - set start/help image (reply to a photo/sticker/document)\n"
+        "/setchannel - add forced join channel\n"
+        "/stats - show stats\n"
+        "/list_sessions - list sessions\n"
+        "/revoke <id> - revoke a session\n"
+        "/broadcast - reply to message to broadcast\n"
+        "/backup_db - backup DB to DB channel\n"
+        "/restore_db - restore DB from pinned\n\n"
+        f"Stats: Active(2d): {s['active_2d']}  Total users: {s['total_users']}  Files: {s['files']}  Sessions: {s['sessions']}"
+    )
+    await message.reply(txt)
+
+@dp.message_handler(commands=["stats"])
+async def cmd_stats(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    s = sql_stats()
+    await message.reply(f"Active(2d): {s['active_2d']}\nTotal users: {s['total_users']}\nTotal files: {s['files']}\nSessions: {s['sessions']}")
+
+@dp.message_handler(commands=["list_sessions"])
+async def cmd_list_sessions(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    rows = sql_list_sessions(200)
+    if not rows:
+        await message.reply("No sessions.")
+        return
+    out = []
+    for r in rows:
+        out.append(f"ID:{r['id']} created:{r['created_at']} protect:{r['protect']} auto_min:{r['auto_delete_minutes']} revoked:{r['revoked']} token:{r['deep_link']}")
+    msg = "\n".join(out)
+    if len(msg) > 4000:
+        await message.reply("Too many sessions to display.")
+    else:
+        await message.reply(msg)
+
+@dp.message_handler(commands=["revoke"])
+async def cmd_revoke(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("Usage: /revoke <id>")
         return
     try:
         sid = int(args)
     except Exception:
-        await message.reply("Invalid session id.", parse_mode=None)
+        await message.reply("Invalid id")
         return
-    if not db.get_session(sid):
-        await message.reply("Session not found.", parse_mode=None)
-        return
-    db.revoke_session(sid)
-    await message.reply(f"Session {sid} revoked.", parse_mode=None)
+    sql_set_session_revoked(sid, 1)
+    await message.reply(f"Session {sid} revoked.")
 
-# =============================================================
-# Fallback collector (owner can send files outside FSM; we still collect)
-# =============================================================
-@dp.message_handler(content_types=types.ContentType.ANY)
-async def fallback_collector(message: types.Message):
-    if message.from_user.id != OWNER_ID:
+@dp.message_handler(commands=["broadcast"])
+async def cmd_broadcast(message: types.Message):
+    """
+    Owner replies to a message to broadcast it (copy) to all users.
+    If a user blocks the bot, they will be removed from DB and owner notified.
+    """
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
         return
-    sess = upload_sessions.get(message.from_user.id)
-    if sess is None:
+    if not message.reply_to_message:
+        await message.reply("Reply to the message you want to broadcast.")
         return
-    sess["items"].append({"from_chat_id": message.chat.id, "message_id": message.message_id})
 
-# =============================================================
-# Startup / Shutdown
-# - Start aiohttp health app inside on_startup so Render sees binding.
-# =============================================================
-async def on_startup_handler(dispatcher: Dispatcher):
-    # start scheduler if not running
-    if not scheduler.running:
+    cur = db.cursor()
+    cur.execute("SELECT id FROM users")
+    users = [r["id"] for r in cur.fetchall()]
+    if not users:
+        await message.reply("No users to broadcast to.")
+        return
+    await message.reply(f"Starting broadcast to {len(users)} users.")
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    lock = asyncio.Lock()
+    stats = {"success": 0, "failed": 0, "removed": []}
+
+    async def worker(uid):
+        nonlocal stats
+        async with sem:
+            try:
+                await bot.copy_message(uid, message.chat.id, message.reply_to_message.message_id)
+                async with lock:
+                    stats["success"] += 1
+            except BotBlocked:
+                # user blocked the bot -> remove from DB and count as removed
+                sql_remove_user(uid)
+                async with lock:
+                    stats["removed"].append(uid)
+            except ChatNotFound:
+                # chat not found -> remove from DB as well
+                sql_remove_user(uid)
+                async with lock:
+                    stats["removed"].append(uid)
+            except BadRequest:
+                # treat as failure but don't remove unless it's a specific error
+                async with lock:
+                    stats["failed"] += 1
+            except RetryAfter as e:
+                logger.warning("Broadcast RetryAfter %s seconds", e.timeout)
+                await asyncio.sleep(e.timeout + 1)
+                try:
+                    await bot.copy_message(uid, message.chat.id, message.reply_to_message.message_id)
+                    async with lock:
+                        stats["success"] += 1
+                except Exception:
+                    async with lock:
+                        stats["failed"] += 1
+            except Exception:
+                async with lock:
+                    stats["failed"] += 1
+
+    tasks = [worker(u) for u in users]
+    await asyncio.gather(*tasks)
+    # notify owner with summary
+    removed_count = len(stats["removed"])
+    await message.reply(f"Broadcast complete. Success: {stats['success']} Failed: {stats['failed']} Removed: {removed_count}")
+    if removed_count:
+        r_sample = stats["removed"][:10]
+        await bot.send_message(OWNER_ID, f"Broadcast removed {removed_count} users (e.g. {r_sample}). These users were removed from DB.")
+
+@dp.message_handler(commands=["backup_db"])
+async def cmd_backup_db(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    sent = await backup_db_to_channel()
+    if sent:
+        await message.reply("DB backed up.")
+    else:
+        await message.reply("Backup failed.")
+
+@dp.message_handler(commands=["restore_db"])
+async def cmd_restore_db(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    ok = await restore_db_from_pinned()
+    if ok:
+        await message.reply("DB restored.")
+    else:
+        await message.reply("Restore failed.")
+
+@dp.message_handler(commands=["del_session"])
+async def cmd_del_session(message: types.Message):
+    if not is_owner(message.from_user.id):
+        await message.reply("Unauthorized.")
+        return
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("Usage: /del_session <id>")
+        return
+    try:
+        sid = int(args)
+    except Exception:
+        await message.reply("Invalid id")
+        return
+    cur = db.cursor()
+    cur.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    db.commit()
+    await message.reply("Session deleted.")
+
+# -------------------------
+# Callback retry handler
+# -------------------------
+@dp.callback_query_handler(cb_retry.filter())
+async def cb_retry_handler(call: types.CallbackQuery, callback_data: dict):
+    await call.answer()
+    session_id = int(callback_data.get("session"))
+    await call.message.answer("Please re-open the deep link you received (tap it in chat) to retry delivery. If channels are joined, delivery should proceed.")
+
+# -------------------------
+# Error handler
+# -------------------------
+@dp.errors_handler()
+async def global_error_handler(update, exception):
+    logger.exception("Update handling failed: %s", exception)
+    return True
+
+# -------------------------
+# Catch-all uploader & user-lastseen handler (SAFE)
+# - This handler only matches:
+#   * non-owner messages that are NOT commands (so /start, /help etc still reach their handlers)
+#   * OR owner messages when owner is actively uploading (so owner's uploads are captured)
+# -------------------------
+def _upload_or_noncommand_filter(m: types.Message) -> bool:
+    # owner path: only match if owner is actively uploading
+    if m.from_user and m.from_user.id == OWNER_ID:
+        return OWNER_ID in active_uploads
+    # non-owner path: do not match bot/command style messages (starting with '/')
+    if getattr(m, "text", None):
+        return not m.text.startswith("/")
+    return True
+
+@dp.message_handler(_upload_or_noncommand_filter, content_types=types.ContentTypes.ANY)
+async def catch_all_store_uploads(message: types.Message):
+    """
+    For owner (while uploading): store messages into active upload session.
+    For others: update last seen.
+    This handler will NOT catch commands (text starting with '/') from non-owner users.
+    """
+    try:
+        if message.from_user.id != OWNER_ID:
+            sql_update_user_lastseen(message.from_user.id, message.from_user.username or "", message.from_user.first_name or "", message.from_user.last_name or "")
+            return
+        # owner and active upload session
+        if OWNER_ID in active_uploads:
+            # ignore commands even in upload (just in case)
+            if message.text and message.text.strip().startswith("/"):
+                return
+            # respect exclude_text setting
+            if message.text and active_uploads[OWNER_ID].get("exclude_text"):
+                pass
+            else:
+                append_upload_message(OWNER_ID, message)
+                try:
+                    await message.reply("Stored in upload session.")
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("Error in catch_all_store_uploads")
+
+# -------------------------
+# Startup & shutdown
+# -------------------------
+async def auto_backup_job():
+    try:
+        await backup_db_to_channel()
+    except Exception:
+        logger.exception("Auto backup failed")
+
+async def on_startup(dispatcher):
+    # restore pinned DB if local missing
+    try:
+        await restore_db_from_pinned()
+    except Exception:
+        logger.exception("restore_db_from_pinned error on startup")
+    # start scheduler
+    try:
         scheduler.start()
-    # start aiohttp health server using AppRunner bound to 0.0.0.0:PORT
+    except Exception:
+        logger.exception("Scheduler start error")
+    # restore delete jobs and schedule them
     try:
-        runner = web.AppRunner(health_app)
-        await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-        await site.start()
-        logger.info("Health endpoint running at 0.0.0.0:%s/health", PORT)
-    except Exception as exc:
-        logger.exception("Failed to start health server on port %s: %s", PORT, exc)
-    logger.info("Bot startup complete. Owner=%s Vault=%s DB=%s JOB_DB=%s", OWNER_ID, VAULT_CHANNEL_ID, DB_PATH, JOB_DB_PATH)
+        await restore_pending_jobs_and_schedule()
+    except Exception:
+        logger.exception("restore_pending_jobs_and_schedule error")
+    # schedule periodic backups every AUTO_BACKUP_HOURS
+    try:
+        try:
+            scheduler.add_job(auto_backup_job, 'interval', hours=AUTO_BACKUP_HOURS, id="auto_backup")
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Failed scheduling auto_backup_job")
+    # start health endpoint (background)
+    try:
+        asyncio.create_task(run_health_app())
+    except Exception:
+        logger.exception("Failed to start health app task")
+    # basic checks: upload & DB channels
+    try:
+        await bot.get_chat(UPLOAD_CHANNEL_ID)
+    except ChatNotFound:
+        logger.error("Upload channel not found. Please add the bot to the upload channel.")
+    except Exception:
+        logger.exception("Error checking upload channel")
+    try:
+        await bot.get_chat(DB_CHANNEL_ID)
+    except ChatNotFound:
+        logger.error("DB channel not found. Please add the bot to the DB channel.")
+    except Exception:
+        logger.exception("Error checking DB channel")
+    # store bot username
+    me = await bot.get_me()
+    db_set("bot_username", me.username or "")
+    # initialize start/help values if missing
+    if db_get("start_text") is None:
+        db_set("start_text", "Welcome, {first_name}!")
+    if db_get("help_text") is None:
+        db_set("help_text", "This bot delivers sessions.")
 
-async def on_shutdown_handler(dispatcher: Dispatcher):
-    logger.info("Shutting down...")
+    # set bot commands for UI
     try:
-        await dispatcher.storage.close()
-        await dispatcher.storage.wait_closed()
+        commands = [
+            BotCommand("start", "Start / open deep link"),
+            BotCommand("help", "Show help"),
+            BotCommand("upload", "Start upload session (owner)"),
+            BotCommand("d", "Finalize upload (owner)"),
+            BotCommand("e", "Cancel upload (owner)"),
+            BotCommand("setmessage", "Set start/help messages (owner)"),
+            BotCommand("setimage", "Set start/help images (owner)"),
+            BotCommand("setchannel", "Set forced channel (owner)"),
+            BotCommand("adminp", "Owner panel"),
+            BotCommand("stats", "Stats (owner)"),
+            BotCommand("list_sessions", "List sessions (owner)"),
+            BotCommand("revoke", "Revoke session (owner)"),
+            BotCommand("broadcast", "Broadcast (owner)"),
+            BotCommand("backup_db", "Backup DB (owner)"),
+            BotCommand("restore_db", "Restore DB (owner)"),
+            BotCommand("del_session", "Delete a session (owner)")
+        ]
+        await bot.set_my_commands(commands)
     except Exception:
-        pass
-    try:
-        db.close()
-    except Exception:
-        pass
-    try:
-        await bot.close()
-    except Exception:
-        pass
-    logger.info("Shutdown complete.")
+        logger.exception("Couldn't set bot commands")
 
-# =============================================================
-# Run
-# =============================================================
+    logger.info("on_startup complete")
+
+async def on_shutdown(dispatcher):
+    logger.info("Shutting down")
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    await bot.close()
+
+# -------------------------
+# Run (polling)
+# -------------------------
 if __name__ == "__main__":
-    from aiogram import executor
     try:
-        executor.start_polling(dp, on_startup=on_startup_handler, on_shutdown=on_shutdown_handler)
+        executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Exit signal received.")
-    except Exception as exc:
-        logger.exception("Run error: %s", exc)
+        logger.info("Stopped by user")
+    except Exception:
+        logger.exception("Fatal error")
